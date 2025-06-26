@@ -188,7 +188,7 @@ config.json
 config.json.bak
 emailed_log.json
 run.bat
-
+.gitignore .gitattributes
 # 忽略所有下载的论文和生成的报告
 download_papers/
 html_reports/
