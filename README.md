@@ -100,7 +100,7 @@ python gui_main.py --run-task
 * **`search_keywords`**: 您关心的研究领域关键词。
 * **`search_years`**: 希望抓取的论文发表年份。
 * **`api_key`**: Gemini API 密钥。
-* **`model_name`**: 使用的 Gemini 模型，例如 `gemini-1.5-pro-latest`。
+* **`model_name`**: 使用的 Gemini 模型，例如 `gemini-2.5-pro`。
 * **`prompt`**: 对 AI下达的核心指令，您可以根据需求进行微调。
 * **`email_*`**: 邮件通知相关配置。
 * **`proxy_*`**: 网络代理配置。
