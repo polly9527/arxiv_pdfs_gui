@@ -7,6 +7,7 @@ import requests
 import time
 import hashlib
 import math
+from tqdm import tqdm
 
 from arxiv_analyzer.utils import arxiv_scrapers
 from arxiv_analyzer.core import llm_interface
@@ -127,8 +128,7 @@ def _download_discovered(progress_data, config, session, progress_callback, prog
     progress_callback(f"准备下载 {len(papers_to_download)} 篇论文...")
     for paper in papers_to_download:
         keyword_folder = sanitize_filename(paper.get('source_keyword', 'default'))
-        # ---【使用新的ArXiv输出目录配置】---
-        pdf_base_dir = os.path.join(config['arxiv_output_dir'], "download_papers", keyword_folder)
+        pdf_base_dir = os.path.join(config['arxiv_output_dir'], keyword_folder)
         pdf_path = download_paper(session, paper, pdf_base_dir, progress_callback)
         updates = {}
         if pdf_path:
@@ -140,69 +140,61 @@ def _download_discovered(progress_data, config, session, progress_callback, prog
         save_progress(progress_file_path, progress_data)
     progress_callback("下载阶段完成。")
 
-def _sync_existing_reports(progress_data, config, progress_callback, progress_file_path):
-    progress_callback("--- 同步阶段: 检查已存在的HTML报告 ---")
-    papers_to_check = [p for p in progress_data.values() if p.get('status') in ['discovered', 'downloaded']]
-    synced_count = 0
-    for paper in papers_to_check:
-        keyword_folder = sanitize_filename(paper.get('source_keyword', 'default_topic'))
-        year_str = "Unknown_Year"
-        submit_date_value = paper.get('submit_date')
-        if isinstance(submit_date_value, datetime): year_str = str(submit_date_value.year)
-        elif isinstance(submit_date_value, str):
-            try: year_str = str(datetime.fromisoformat(submit_date_value).year)
-            except (ValueError, TypeError): pass
-        # ---【使用新的ArXiv输出目录配置】---
-        html_dir = os.path.join(config['arxiv_output_dir'], "html_reports", keyword_folder, year_str)
-        report_filename = f"{sanitize_filename(paper['title'])}_report.html"
-        expected_report_path = os.path.join(html_dir, report_filename)
-        if os.path.exists(expected_report_path):
-            html_md5 = get_file_md5(expected_report_path)
-            updates = {'status': 'analyzed', 'analysis_path': expected_report_path, 'html_md5': html_md5}
-            update_progress(paper['uid'], updates, progress_data)
-            synced_count += 1
-            progress_callback(f"  发现并同步已存在的报告: {paper['title']}")
-    if synced_count > 0:
-        progress_callback(f"同步了 {synced_count} 个已存在的报告，正在保存进度...")
-        save_progress(progress_file_path, progress_data)
-    else:
-        progress_callback("没有发现可同步的旧报告。")
-
-def _analyze_downloaded(progress_data, config, progress_callback, progress_file_path):
-    progress_callback("--- 阶段 3/4: 分析已下载的论文 ---")
-    if not llm_interface.configure_llm(config, progress_callback):
-        return
-    papers_to_analyze = [p for p in progress_data.values() if p.get('local_path') and p.get('status') in ['downloaded', 'failed']]
-    if not papers_to_analyze:
+def _analyze_papers(progress_data, config, progress_callback, progress_file_path, papers_to_process):
+    """统一的分析函数，包含智能跳过和即时保存逻辑"""
+    if not papers_to_process:
         progress_callback("没有需要分析的论文。")
         return
-    progress_callback(f"准备分析 {len(papers_to_analyze)} 篇论文...")
-    for i, paper in enumerate(papers_to_analyze):
-        html_report = llm_interface.analyze_paper_by_uploading(paper['local_path'], paper, progress_callback, {'current': i + 1, 'total': len(papers_to_analyze)})
-        updates = {}
-        if html_report:
-            keyword_folder = sanitize_filename(paper.get('source_keyword', 'default_topic'))
-            year_str = "Unknown_Year"
-            submit_date_value = paper.get('submit_date')
-            if isinstance(submit_date_value, datetime): year_str = str(submit_date_value.year)
-            elif isinstance(submit_date_value, str):
-                try: year_str = str(datetime.fromisoformat(submit_date_value).year)
-                except (ValueError, TypeError): pass
-            # ---【使用新的ArXiv输出目录配置】---
-            html_dir = os.path.join(config['arxiv_output_dir'], "html_reports", keyword_folder, year_str)
-            os.makedirs(html_dir, exist_ok=True)
-            report_filename = f"{sanitize_filename(paper['title'])}_report.html"
-            report_path = os.path.join(html_dir, report_filename)
-            try:
-                with open(report_path, 'w', encoding='utf-8') as f: f.write(html_report)
+
+    progress_callback(f"--- 阶段 3/4: 分析 {len(papers_to_process)} 篇论文 ---")
+    if not llm_interface.configure_llm(config, progress_callback):
+        return
+
+    for i, paper in enumerate(papers_to_process):
+        pdf_path = paper.get('local_path')
+        if not pdf_path or not os.path.exists(pdf_path):
+            progress_callback(f"  跳过 (PDF文件不存在): {paper.get('title', '未知标题')}")
+            continue
+
+        report_filename = f"{os.path.splitext(os.path.basename(pdf_path))[0]}_report.html"
+        report_path = os.path.join(os.path.dirname(pdf_path), report_filename)
+
+        # ---【关键修改点】---
+        # 修正了这里的同步逻辑
+        if os.path.exists(report_path):
+            current_status = paper.get('status')
+            # 只有当状态不是 'emailed' 时，才进行同步更新
+            if current_status != 'emailed':
+                progress_callback(f"  发现已存在的报告，正在同步状态: {paper.get('title', '未知标题')}")
                 html_md5 = get_file_md5(report_path)
                 updates = {'status': 'analyzed', 'analysis_path': report_path, 'html_md5': html_md5}
+                update_progress(paper['uid'], updates, progress_data)
+                save_progress(progress_file_path, progress_data)
+            else:
+                 progress_callback(f"  跳过 (报告已存在且已发送邮件): {paper.get('title', '未知标题')}")
+            continue # 无论如何都跳过分析
+
+        # 如果报告不存在，则执行分析
+        html_report = llm_interface.analyze_paper_by_uploading(pdf_path, paper, progress_callback, {'current': i + 1, 'total': len(papers_to_process)})
+        
+        updates = {}
+        if html_report:
+            try:
+                with open(report_path, 'w', encoding='utf-8') as f:
+                    f.write(html_report)
+                html_md5 = get_file_md5(report_path)
+                updates = {'status': 'analyzed', 'analysis_path': report_path, 'html_md5': html_md5}
+                progress_callback(f"  分析成功: {paper.get('title', '未知标题')}")
             except Exception as e:
                 updates = {'status': 'failed', 'failure_reason': f'Report Save Failed: {e}'}
+                progress_callback(f"  错误 (保存报告失败): {paper.get('title', '未知标题')}")
         else:
             updates = {'status': 'failed', 'failure_reason': 'LLM Analysis Failed'}
+            progress_callback(f"  错误 (AI分析失败): {paper.get('title', '未知标题')}")
+        
         update_progress(paper['uid'], updates, progress_data)
         save_progress(progress_file_path, progress_data)
+
     progress_callback("分析阶段完成。")
 
 def _send_reports(progress_data, config, progress_callback, progress_file_path):
@@ -253,10 +245,11 @@ def _process_and_send_group(report_group, group_name, progress_data, progress_ca
 # --- 主工作流入口 ---
 
 def run_full_workflow(config, progress_callback):
-    """完整工作流(ArXiv)：发现->下载->同步->分析->发送"""
+    """完整工作流(ArXiv)：发现->下载->分析->发送"""
     progress_callback("--- 开始执行完整工作流 (ArXiv) ---")
     PROGRESS_FILE = os.path.join(config['root_dir'], 'analysis_progress.json')
     progress_data = load_progress(PROGRESS_FILE)
+    
     req_session = requests.Session()
     if config.get('proxy_enabled'):
         proxy_url = f"http://{config['proxy_host']}:{config['proxy_port']}"
@@ -264,18 +257,17 @@ def run_full_workflow(config, progress_callback):
 
     _discover_arxiv(progress_data, config, req_session, progress_callback, PROGRESS_FILE)
     _download_discovered(progress_data, config, req_session, progress_callback, PROGRESS_FILE)
-    _sync_existing_reports(progress_data, config, progress_callback, PROGRESS_FILE)
-    _analyze_downloaded(progress_data, config, progress_callback, PROGRESS_FILE)
+    
+    papers_to_process = [p for p in progress_data.values() if p.get('source') == 'arXiv' and p.get('status') in ['downloaded', 'failed']]
+    _analyze_papers(progress_data, config, progress_callback, PROGRESS_FILE, papers_to_process)
+    
     _send_reports(progress_data, config, progress_callback, PROGRESS_FILE)
-
     progress_callback("--- ArXiv工作流执行完毕 ---")
-
 
 def run_local_analysis_workflow(config, progress_callback):
     """本地文件夹分析工作流：发现->分析->发送"""
     progress_callback("--- 开始执行本地文件夹分析工作流 ---")
     PROGRESS_FILE = os.path.join(config['root_dir'], 'analysis_progress.json')
-    # ---【使用新的本地扫描目录配置】---
     target_folder = config.get('local_scan_dir')
     progress_data = load_progress(PROGRESS_FILE)
     
@@ -283,7 +275,6 @@ def run_local_analysis_workflow(config, progress_callback):
         progress_callback(f"错误：配置中指定的扫描路径无效: {target_folder}")
         return
 
-    # 1. 发现本地文件并检查状态
     progress_callback(f"--- 阶段 1/3: 扫描文件夹 {target_folder} ---")
     papers_to_process = []
     for root, _, files in os.walk(target_folder):
@@ -293,43 +284,19 @@ def run_local_analysis_workflow(config, progress_callback):
                 pdf_md5 = get_file_md5(file_path)
                 if not pdf_md5: continue
                 uid = f"local_{pdf_md5}"
+                
                 paper_entry = progress_data.get(uid)
-                if paper_entry and paper_entry.get('status') in ['analyzed', 'emailed']:
-                    progress_callback(f"  已跳过 (已分析): {filename}")
-                    continue
-                updates = {'uid': uid, 'title': os.path.splitext(filename)[0], 'local_path': file_path, 'pdf_md5': pdf_md5, 'status': 'downloaded', 'source': 'Local Folder'}
-                update_progress(uid, updates, progress_data)
-                papers_to_process.append(progress_data[uid])
-                progress_callback(f"  已加入任务队列: {filename}")
+                if not paper_entry or paper_entry.get('status') not in ['analyzed', 'emailed']:
+                    updates = {'uid': uid, 'title': os.path.splitext(filename)[0], 'local_path': file_path, 'pdf_md5': pdf_md5, 'status': 'downloaded', 'source': 'Local Folder'}
+                    update_progress(uid, updates, progress_data)
+                    papers_to_process.append(progress_data[uid])
+                    progress_callback(f"  已加入任务队列: {filename}")
+                else:
+                    progress_callback(f"  已跳过 (已分析过): {filename}")
+    
     save_progress(PROGRESS_FILE, progress_data)
-
-    if not papers_to_process:
-        progress_callback("扫描完成，没有需要分析的新文件。")
-    else:
-        # 2. 分析新发现的本地文件
-        progress_callback(f"--- 阶段 2/3: 分析 {len(papers_to_process)} 个本地文件 ---")
-        if not llm_interface.configure_llm(config, progress_callback):
-            return
-        for i, paper in enumerate(papers_to_process):
-            html_report = llm_interface.analyze_paper_by_uploading(paper['local_path'], paper, progress_callback, {'current': i + 1, 'total': len(papers_to_process)})
-            updates = {}
-            if html_report:
-                pdf_dir = os.path.dirname(paper['local_path'])
-                report_filename = f"{os.path.splitext(os.path.basename(paper['local_path']))[0]}_report.html"
-                report_path = os.path.join(pdf_dir, report_filename)
-                try:
-                    with open(report_path, 'w', encoding='utf-8') as f: f.write(html_report)
-                    html_md5 = get_file_md5(report_path)
-                    updates = {'status': 'analyzed', 'analysis_path': report_path, 'html_md5': html_md5}
-                except Exception as e:
-                    updates = {'status': 'failed', 'failure_reason': f'Report Save Failed: {e}'}
-            else:
-                updates = {'status': 'failed', 'failure_reason': 'LLM Analysis Failed'}
-            update_progress(paper['uid'], updates, progress_data)
-            save_progress(PROGRESS_FILE, progress_data)
-
-    # 3. 发送邮件 (无论有无新分析，都检查是否有待发送)
-    progress_callback("--- 阶段 3/3: 检查并发送邮件报告 ---")
+    
+    _analyze_papers(progress_data, config, progress_callback, PROGRESS_FILE, papers_to_process)
     _send_reports(progress_data, config, progress_callback, PROGRESS_FILE)
     
     progress_callback("--- 本地文件夹分析工作流执行完毕 ---")
